@@ -1,4 +1,3 @@
-
 """
   Copyright 2011 Jeff Garzik
 
@@ -46,11 +45,12 @@ try:
     import urllib.parse as urlparse
 except ImportError:
     import urlparse
+from time import sleep
 
 USER_AGENT = "AuthServiceProxy/0.1"
 
 HTTP_TIMEOUT = 30
-
+RECONN_INTERVAL = 3
 
 class JSONRPCException(Exception):
     def __init__(self, rpc_error):
@@ -66,14 +66,15 @@ def EncodeDecimal(o):
 class AuthServiceProxy(object):
     __id_count = 0
 
-    def __init__(self, service_url, service_name=None, timeout=HTTP_TIMEOUT, connection=None):
+    def __init__(self, service_url, service_name=None, timeout=HTTP_TIMEOUT, origin=None):
         self.__service_url = service_url
         self.__service_name = service_name
         self.__url = urlparse.urlparse(service_url)
         if self.__url.port is None:
-            port = 80
-        else:
-            port = self.__url.port
+            if self.__url.scheme == 'https':
+                self.__url.port = httplib.HTTPS_PORT
+            else:
+                self.__url.port = httplib.HTTP_PORT
         (user, passwd) = (self.__url.username, self.__url.password)
         try:
             user = user.encode('utf8')
@@ -85,23 +86,31 @@ class AuthServiceProxy(object):
             pass
         authpair = user + b':' + passwd
         self.__auth_header = b'Basic ' + base64.b64encode(authpair)
-        
-        if connection: 
-            # Callables re-use the connection of the original proxy 
-            self.__conn = connection
-        elif self.__url.scheme == 'https':
+
+        self.__origin = origin
+        if origin and origin.__conn:
+            # Callables re-use the connection of the original proxy
+            self.__conn = origin.__conn
+        else:
+            self._create_connection(timeout)
+
+    def _create_connection(self, timeout=HTTP_TIMEOUT):
+        if self.__url.scheme == 'https':
             if sys.version_info < (3, 4):
-                self.__conn = httplib.HTTPSConnection(self.__url.hostname, port,
+                self.__conn = httplib.HTTPSConnection(self.__url.hostname, self.__url.port,
                                                       None, None, False, timeout)
             else:
-                self.__conn = httplib.HTTPSConnection(self.__url.hostname, port,
+                self.__conn = httplib.HTTPSConnection(self.__url.hostname, self.__url.port,
                                                       None, None, timeout)
         else:
             if sys.version_info < (3, 4):
-                self.__conn = httplib.HTTPConnection(self.__url.hostname, port,
+                self.__conn = httplib.HTTPConnection(self.__url.hostname, self.__url.port,
                                                      False, timeout)
             else:
-                self.__conn = httplib.HTTPConnection(self.__url.hostname, port, timeout)
+                self.__conn = httplib.HTTPConnection(self.__url.hostname, self.__url.port, timeout)
+
+        if self.__origin and self.__origin.__conn:
+            self.__origin.__conn = self.__conn
 
     def __getattr__(self, name):
         if name.startswith('__') and name.endswith('__'):
@@ -109,7 +118,7 @@ class AuthServiceProxy(object):
             raise AttributeError
         if self.__service_name is not None:
             name = "%s.%s" % (self.__service_name, name)
-        return AuthServiceProxy(self.__service_url, name, connection=self.__conn)
+        return AuthServiceProxy(self.__service_url, name, origin=self)
 
     def __call__(self, *args):
         AuthServiceProxy.__id_count += 1
@@ -118,13 +127,22 @@ class AuthServiceProxy(object):
                                'method': self.__service_name,
                                'params': args,
                                'id': AuthServiceProxy.__id_count}, default=EncodeDecimal)
-        self.__conn.request('POST', self.__url.path, postdata,
-                            {'Host': self.__url.hostname,
-                             'User-Agent': USER_AGENT,
-                             'Authorization': self.__auth_header,
-                             'Content-type': 'application/json'})
 
-        response = self._get_response()
+        reconn_count = 0
+        while reconn_count < 5:
+            try:
+                self.__conn.request('POST', self.__url.path, postdata,
+                                    {'Host': self.__url.hostname,
+                                     'User-Agent': USER_AGENT,
+                                     'Authorization': self.__auth_header,
+                                     'Content-type': 'application/json'})
+                response = self._get_response()
+                break
+            except:
+                reconn_count += 1
+                sleep(RECONN_INTERVAL)
+                self._create_connection()
+
         if response['error'] is not None:
             raise JSONRPCException(response['error'])
         elif 'result' not in response:
